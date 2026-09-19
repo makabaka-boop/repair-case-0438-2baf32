@@ -286,7 +286,11 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 // transaction — the same row-lock arbitration SubmitChunk and SealBatch use
 // for their one row — so a reversed pair of group requests, a single-batch
 // seal and the final chunk submission serialise on the same locks without
-// deadlocking. Gaps are computed from the post-lock snapshot, and the group
+// deadlocking. The transaction runs READ COMMITTED like every other
+// operation: a stronger level would pin the verdict snapshot to before the
+// lock wait, hiding chunks committed during the wait and turning a
+// concurrent sealer into a serialization failure instead of an idempotent
+// success. Gaps are computed from the post-lock snapshot, and the group
 // commits only when every OPEN member is complete: the batch set can never
 // be observed partially sealed. Members already SEALED count as idempotent
 // successes and keep their original sealedAt.
@@ -311,7 +315,16 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 	}
 	sort.Strings(sorted)
 
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	// READ COMMITTED is load-bearing, not a default to tighten. The locking
+	// SELECT below starts executing — and under REPEATABLE READ would pin the
+	// transaction snapshot — before it waits on any row lock, so with a
+	// stronger level a chunk committed during the wait would stay invisible
+	// and be misreported as a gap, and a member sealed by a concurrent
+	// transaction would abort the lock wait with SQLSTATE 40001 instead of
+	// being re-read as SEALED. Here every statement snapshots after the locks
+	// are held, and member rows cannot change between the gap check and the
+	// UPDATE: every writer must hold these same row locks first.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, err
 	}

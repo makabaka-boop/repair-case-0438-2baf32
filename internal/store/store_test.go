@@ -1035,6 +1035,107 @@ func TestSealGroupVsSingleSealDeterministic(t *testing.T) {
 	}
 }
 
+// TestSealGroupSeesChunkCommittedDuringLockWait stages the interleave where
+// B's final chunk wins the row lock and commits while the group request is
+// still parked on that lock: the chunk's critical section (lock B's row,
+// insert the chunk) is replayed on a raw connection and held open, the group
+// seal queues behind it, and only then does the chunk commit. The group's
+// verdict must be computed from the state after the locks are acquired, so
+// it observes the committed chunk and seals the group. A verdict snapshot
+// pinned before the lock wait (REPEATABLE READ) would instead report the
+// just-committed seq as a gap and fail with ErrIncomplete, leaving B
+// complete but OPEN — the caller then misreads the group as unsealable.
+func TestSealGroupSeesChunkCommittedDuringLockWait(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newStore(ctx, t)
+
+	a := mustBatch(ctx, t, s, 1)
+	b := mustBatch(ctx, t, s, 2)
+	if _, err := s.SubmitChunk(ctx, a.ID, 1, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("b1")); err != nil {
+		t.Fatal(err)
+	}
+	// B is missing only its final chunk (seq 2).
+
+	// Replay SubmitChunk's critical section for B's final chunk on a raw
+	// connection, holding the transaction open between the insert and the
+	// commit: the chunk occupies B's row lock first, exactly like a
+	// concurrent submission that won the lock race.
+	schema := testSchema(t)
+	chunkTx, err := basePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chunkTx.Rollback(ctx)
+	if _, err := chunkTx.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunkTx.Exec(ctx,
+		`SELECT expected_chunks, status FROM batches WHERE id = $1 FOR UPDATE`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chunkTx.Exec(ctx,
+		`INSERT INTO chunks (batch_id, seq, payload) VALUES ($1, $2, $3)`,
+		b.ID, 2, []byte("b2")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The group seal locks A, then parks on B behind the uncommitted chunk.
+	// Being parked proves its first statement already started, so a
+	// transaction-scoped snapshot would already be frozen without the chunk.
+	groupDone := make(chan struct{})
+	var snaps []*store.Snapshot
+	var groupErr error
+	go func() {
+		defer close(groupDone)
+		snaps, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID})
+	}()
+	if !waitForTupleLock(ctx, t, schema, b.ID) {
+		t.Fatal("group seal never parked waiting for B's row lock")
+	}
+
+	// The final chunk commits during the group's lock wait; the group then
+	// acquires its locks and must see the complete chunk set.
+	if err := chunkTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-groupDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("group seal deadlocked")
+	}
+
+	if groupErr != nil {
+		t.Fatalf("group waited for the final chunk commit, so it must seal; got %v", groupErr)
+	}
+	if len(snaps) != 2 || snaps[0].ID != a.ID || snaps[1].ID != b.ID {
+		t.Fatalf("snapshots not in request order: %+v", snaps)
+	}
+	for _, snap := range snaps {
+		if snap.Status != store.StatusSealed || snap.SealedAt == nil || len(snap.Gaps) != 0 {
+			t.Fatalf("member not cleanly sealed: %+v", snap)
+		}
+	}
+	if !snaps[0].SealedAt.Equal(*snaps[1].SealedAt) {
+		t.Fatalf("members not sealed by one transaction: %v vs %v",
+			snaps[0].SealedAt, snaps[1].SealedAt)
+	}
+
+	// The committed database state agrees with the 200 response.
+	for i, id := range []string{a.ID, b.ID} {
+		db, err := s.Snapshot(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if db.Status != store.StatusSealed || len(db.Gaps) != 0 ||
+			db.SealedAt == nil || !db.SealedAt.Equal(*snaps[i].SealedAt) {
+			t.Fatalf("database disagrees with group response: db=%+v resp=%+v", db, snaps[i])
+		}
+	}
+}
+
 // TestRestartConsistency closes every connection and opens a fresh store,
 // modelling a full restart of all API instances: acknowledgements, gaps and
 // sealing verdict must survive unchanged.
