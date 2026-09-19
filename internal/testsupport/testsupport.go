@@ -52,6 +52,30 @@ func IsolatedSchema(ctx context.Context, t *testing.T) string {
 	return schema
 }
 
+// RowLockTx opens a transaction on the shared admin pool, pins its search
+// path to schema and locks the batches row for batchID with FOR UPDATE. The
+// returned commit/rollback functions release the staged lock. This lets an
+// HTTP test park real API requests behind a known lock holder.
+func RowLockTx(ctx context.Context, t *testing.T, schema, batchID string) (commit, rollback func() error) {
+	t.Helper()
+	if adminErr != nil {
+		t.Fatalf("admin pool unavailable: %v", adminErr)
+	}
+	tx, err := adminPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocker transaction: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("pin blocker search path: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM batches WHERE id = $1 FOR UPDATE`, batchID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("blocker lock %s: %v", batchID, err)
+	}
+	return func() error { return tx.Commit(ctx) }, func() error { return tx.Rollback(ctx) }
+}
+
 // DropSchema removes an isolated schema.
 func DropSchema(ctx context.Context, schema string) {
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)

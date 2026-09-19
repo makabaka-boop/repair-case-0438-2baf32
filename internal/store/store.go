@@ -286,10 +286,20 @@ func (s *Store) SealBatch(ctx context.Context, batchID string) (*Snapshot, error
 // transaction — the same row-lock arbitration SubmitChunk and SealBatch use
 // for their one row — so a reversed pair of group requests, a single-batch
 // seal and the final chunk submission serialise on the same locks without
-// deadlocking. Gaps are computed from the post-lock snapshot, and the group
-// commits only when every OPEN member is complete: the batch set can never
-// be observed partially sealed. Members already SEALED count as idempotent
-// successes and keep their original sealedAt.
+// deadlocking. The transaction runs at Read Committed: the member header
+// read and the gap query are each a statement-level snapshot taken only
+// AFTER every FOR UPDATE lock is held, so the group observes exactly the
+// state committed by whatever transaction held the locks just before it —
+// both headers (a preceding SealGroup/SealBatch) and chunk rows (a
+// just-committed final piece). Repeatable Read is wrong here: its snapshot
+// is fixed when the transaction's first statement runs, i.e. BEFORE the
+// lock wait, so the queued group would keep the pre-wait snapshot and
+// either hit SQLSTATE 40001 on rows a preceding group sealed (surfaced as a
+// spurious 500) or still report as gaps the final chunks committed while
+// it waited (a spurious 409 INCOMPLETE despite the members already being
+// complete). The group commits only when every OPEN member is complete, so
+// the batch set can never be observed partially sealed. Members already
+// SEALED count as idempotent successes and keep their original sealedAt.
 //
 // Return values:
 //
@@ -311,14 +321,19 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 	}
 	sort.Strings(sorted)
 
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	// Read Committed: post-lock statement snapshots, never the stale
+	// pre-wait snapshot Repeatable Read would keep (see the doc comment).
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
 	// LockRows sits above the sort in the plan, so the FOR UPDATE locks are
-	// acquired in ascending ID order in one statement.
+	// acquired in ascending ID order in one statement. Under Read Committed
+	// the query's statement snapshot is taken as of statement execution, so
+	// once all locks are acquired every header reflects the latest committed
+	// verdict of the preceding lock holder.
 	rows, err := tx.Query(ctx,
 		`SELECT id, expected_chunks, status, created_at, sealed_at
 		 FROM batches WHERE id = ANY($1) ORDER BY id FOR UPDATE`, sorted)
@@ -342,7 +357,12 @@ func (s *Store) SealGroup(ctx context.Context, ids []string) ([]*Snapshot, error
 		return nil, ErrNotFound
 	}
 
-	// Gaps for every member from the post-lock snapshot, in one query.
+	// Gaps for every member from the post-lock statement snapshot, in one
+	// query. The lock-acquiring statement has already finished (all member
+	// rows locked), so under Read Committed this new statement sees every
+	// chunk committed before the group took the locks — including a final
+	// piece that acquired the row lock ahead of the group and committed
+	// while the group queued.
 	gapRows, err := tx.Query(ctx, `
 		SELECT b.id, s.seq
 		FROM batches b

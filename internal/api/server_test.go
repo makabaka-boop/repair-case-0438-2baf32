@@ -623,6 +623,123 @@ func TestHTTPSealGroupValidation(t *testing.T) {
 	}
 }
 
+// httpResult is one completed group/chunk request in a staged race.
+type httpResult struct {
+	code int
+	body map[string]any
+}
+
+// TestHTTPSealGroupFinalChunkCommittedWhileQueued reproduces the externally
+// visible handoff inconsistency: A is complete, B is missing only its final
+// piece. A blocker holds B's row lock; the final chunk queues on B first,
+// then the group seal queues behind it. When the blocker releases, the
+// chunk lands before the group reaches B. The group must answer 200 with
+// both members SEALED. The buggy Repeatable Read group kept its pre-wait
+// snapshot and answered 409 INCOMPLETE (listing B's just-committed seq),
+// after which GET reported B complete yet still OPEN — a contradiction that
+// makes the caller repeat or abort the whole-group handoff.
+func TestHTTPSealGroupFinalChunkCommittedWhileQueued(t *testing.T) {
+	ctx := context.Background()
+	base := testsupport.RequireURL(t)
+	schema := testsupport.IsolatedSchema(ctx, t)
+	defer testsupport.DropSchema(ctx, schema)
+	c := newClient()
+
+	s1, err := store.New(ctx, testsupport.SchemaURL(base, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.New(ctx, testsupport.SchemaURL(base, schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv1 := httptest.NewServer(api.NewServer(s1, nil).Handler())
+	srv2 := httptest.NewServer(api.NewServer(s2, nil).Handler())
+	defer func() { srv1.Close(); srv2.Close(); s1.Close(); s2.Close() }()
+
+	_, body := c.post(t, srv1.URL+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	a := body["batchId"].(string)
+	_, body = c.post(t, srv2.URL+"/api/v1/batches", map[string]int{"expectedChunks": 2})
+	b := body["batchId"].(string)
+	for _, step := range []struct {
+		base, id, payload string
+		seq               int
+	}{
+		{srv1.URL, a, "a1", 1},
+		{srv2.URL, a, "a2", 2},
+		{srv1.URL, b, "b1", 1}, // B missing only the final seq 2
+	} {
+		code, resp := c.post(t, step.base+"/api/v1/batches/"+step.id+"/chunks",
+			map[string]any{"seq": step.seq, "payload": step.payload})
+		if code != 201 {
+			t.Fatalf("fixture chunk %s/%d: code=%d body=%v", step.id, step.seq, code, resp)
+		}
+	}
+
+	// Hold B's row lock so chunk submission and the group queue in a known
+	// order.
+	commitBlocker, rollbackBlocker := testsupport.RowLockTx(ctx, t, schema, b)
+	defer func() { _ = rollbackBlocker() }()
+
+	chunkRes := make(chan httpResult, 1)
+	go func() {
+		code, resp := c.postQuiet(srv2.URL+"/api/v1/batches/"+b+"/chunks",
+			map[string]any{"seq": 2, "payload": "b2"})
+		chunkRes <- httpResult{code, resp}
+	}()
+	// Give the chunk request time to park on B's lock ahead of the group.
+	time.Sleep(300 * time.Millisecond)
+
+	groupRes := make(chan httpResult, 1)
+	go func() {
+		code, resp := c.postQuiet(srv1.URL+"/api/v1/batches/seal-group",
+			map[string]any{"batchIds": []string{a, b}})
+		groupRes <- httpResult{code, resp}
+	}()
+	time.Sleep(300 * time.Millisecond)
+
+	// Release: the final chunk lands first, then the group takes B's lock.
+	if err := commitBlocker(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case r := <-chunkRes:
+		if r.code != 201 {
+			t.Fatalf("final chunk should be accepted, got %d %v", r.code, r.body)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("final chunk request hung")
+	}
+	select {
+	case r := <-groupRes:
+		if r.code != 200 {
+			t.Fatalf("group returned %d %v after the final chunk committed while "+
+				"the group queued; expected 200 SEALED for both members", r.code, r.body)
+		}
+		members, _ := r.body["batches"].([]any)
+		if len(members) != 2 {
+			t.Fatalf("200 group response without 2 members: %v", r.body)
+		}
+		for _, m := range members {
+			member := m.(map[string]any)
+			if member["status"] != "SEALED" || member["sealedAt"] == nil {
+				t.Fatalf("group member not cleanly sealed: %v", member)
+			}
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("group request hung behind the final chunk")
+	}
+
+	for _, id := range []string{a, b} {
+		code, snap := c.get(t, srv2.URL+"/api/v1/batches/"+id)
+		if code != 200 || snap["status"] != "SEALED" || snap["sealedAt"] == nil ||
+			int(snap["received"].(float64)) != 2 || len(snap["gaps"].([]any)) != 0 {
+			t.Fatalf("post-group state for %s inconsistent: %d %v", id, code, snap)
+		}
+	}
+}
+
 // TestHTTPSealGroupThreeWayRace fires the [A,B] group on one instance, the
 // reversed [B,A] group on the other and B's final chunk concurrently. With a
 // hard timeout as deadlock tripwire, the only legal outcomes are the whole
@@ -640,28 +757,24 @@ func TestHTTPSealGroupThreeWayRace(t *testing.T) {
 		b := body["batchId"].(string)
 		c.post(t, u1+"/api/v1/batches/"+a+"/chunks", map[string]any{"seq": 1, "payload": "a"})
 
-		type result struct {
-			code int
-			body map[string]any
-		}
-		resCh := make(chan result, 3)
+		resCh := make(chan httpResult, 3)
 		go func() {
 			code, resp := c.postQuiet(u1+"/api/v1/batches/seal-group",
 				map[string]any{"batchIds": []string{a, b}})
-			resCh <- result{code, resp}
+			resCh <- httpResult{code, resp}
 		}()
 		go func() {
 			code, resp := c.postQuiet(u2+"/api/v1/batches/seal-group",
 				map[string]any{"batchIds": []string{b, a}})
-			resCh <- result{code, resp}
+			resCh <- httpResult{code, resp}
 		}()
 		go func() {
 			code, resp := c.postQuiet(u1+"/api/v1/batches/"+b+"/chunks",
 				map[string]any{"seq": 1, "payload": "final"})
-			resCh <- result{code, resp}
+			resCh <- httpResult{code, resp}
 		}()
 
-		var results []result
+		var results []httpResult
 		timeout := time.After(30 * time.Second)
 		for len(results) < 3 {
 			select {

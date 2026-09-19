@@ -768,6 +768,123 @@ func TestSealGroupVsSingleSealRace(t *testing.T) {
 	}
 }
 
+// TestSealGroupFinalChunkCommittedWhileQueued reproduces the handoff bug:
+// A is complete, B misses only its final chunk. A blocker holds B's row
+// lock. The final-chunk submission queues on B FIRST, then the group seal
+// queues behind it. When the blocker releases, the chunk commits before
+// the group reaches B. The group must seal the whole group; a transaction
+// snapshot taken before the lock wait (Repeatable Read) still sees B's
+// seq as a gap and returns a spurious ErrIncomplete even though the
+// committed state already has B complete — leaving B OPEN-but-complete
+// and making the caller repeat or abort the handoff.
+func TestSealGroupFinalChunkCommittedWhileQueued(t *testing.T) {
+	ctx := context.Background()
+	s, newPeer := newStore(ctx, t)
+	chunker := newPeer()
+	defer chunker.Close()
+
+	a := mustBatch(ctx, t, s, 2)
+	b := mustBatch(ctx, t, s, 2)
+	for seq, p := range map[int]string{1: "a1", 2: "a2"} {
+		if _, err := s.SubmitChunk(ctx, a.ID, seq, []byte(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// B has everything but the final piece.
+	if _, err := s.SubmitChunk(ctx, b.ID, 1, []byte("b1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Blocker holds B's row lock so both the chunk submission and the group
+	// park in a known queue order.
+	blocker, err := basePool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	schema := testSchema(t)
+	if _, err := blocker.Exec(ctx, "SET LOCAL search_path = "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := blocker.Exec(ctx, `SELECT id FROM batches WHERE id = $1 FOR UPDATE`, b.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	chunkDone := make(chan struct{})
+	var chunkErr error
+	go func() {
+		defer close(chunkDone)
+		_, chunkErr = chunker.SubmitChunk(ctx, b.ID, 2, []byte("b2"))
+	}()
+	// The final piece queues on B first and must sit ahead of the group.
+	if !waitForTupleLock(ctx, t, schema, b.ID) {
+		t.Fatal("final chunk never parked waiting for B's row lock")
+	}
+
+	groupDone := make(chan struct{})
+	var groupSnaps []*store.Snapshot
+	var groupErr error
+	go func() {
+		defer close(groupDone)
+		groupSnaps, groupErr = s.SealGroup(ctx, []string{a.ID, b.ID})
+	}()
+
+	// Release B: the chunk submission is first in the lock queue, inserts
+	// the final piece and commits; the group then acquires both rows.
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-chunkDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("final chunk submission deadlocked")
+	}
+	select {
+	case <-groupDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("group seal deadlocked while queued behind the final chunk")
+	}
+
+	if chunkErr != nil {
+		t.Fatalf("final chunk submission failed: %v", chunkErr)
+	}
+	if groupErr != nil {
+		t.Fatalf("group returned %v even though the final chunk committed "+
+			"before the group took B's lock; the response must match the "+
+			"committed state", groupErr)
+	}
+	if len(groupSnaps) != 2 {
+		t.Fatalf("group snapshots wrong: %+v", groupSnaps)
+	}
+	for _, snap := range groupSnaps {
+		if snap.Status != store.StatusSealed || snap.SealedAt == nil ||
+			snap.Received != snap.ExpectedChunks || len(snap.Gaps) != 0 {
+			t.Fatalf("group response member not cleanly sealed: %+v", snap)
+		}
+	}
+
+	// The response must match the database: both members SEALED, complete,
+	// stamped by the one group transaction (same sealedAt).
+	dbA, err := s.Snapshot(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbB, err := s.Snapshot(ctx, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbA.Status != store.StatusSealed || dbB.Status != store.StatusSealed {
+		t.Fatalf("database not sealed: A=%s B=%s", dbA.Status, dbB.Status)
+	}
+	if len(dbA.Gaps) != 0 || len(dbB.Gaps) != 0 {
+		t.Fatalf("sealed members carry gaps: %+v %+v", dbA, dbB)
+	}
+	if !dbA.SealedAt.Equal(*dbB.SealedAt) {
+		t.Fatalf("members sealed by different transactions: %v vs %v",
+			dbA.SealedAt, dbB.SealedAt)
+	}
+}
+
 // waitForTupleLock polls until some backend is blocked on the batches row
 // with batchID, returning false on timeout. PostgreSQL does not publish a
 // lock holder's FOR UPDATE row lock in pg_locks — only the contender shows
